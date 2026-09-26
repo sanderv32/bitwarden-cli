@@ -29,7 +29,8 @@ cargo run -- --email user@example.com list
 cargo run -- --email user@example.com search github
 cargo run -- --email user@example.com get <uuid>/password
 cargo run -- --email user@example.com sync    # force-refresh the vault cache
-cargo run -- --email user@example.com logout  # clear session + vault cache
+cargo run -- --email user@example.com logout  # revoke refresh token, clear session + vault cache
+cargo run -- --email user@example.com device rotate  # regenerate the persisted device UUID
 
 # Email can also come from BW_USERNAME.
 export BW_USERNAME=user@example.com
@@ -57,8 +58,8 @@ cargo fmt -- --check # Check formatting without modifying
 ### Module Structure
 
 - **main.rs**: Application entry point.
-  - Dispatches subcommands (`login`, `list`, `search`, `get`, `sync`, `logout`)
-  - Interactive input helpers (`input()` — trims whitespace, `password()` — hidden input)
+  - Dispatches subcommands (`login`, `list`, `search`, `get`, `sync`, `logout`, `device rotate`)
+  - Interactive input helpers (`input()` — trims whitespace, `password()` — hidden input, returns `Zeroizing<String>`)
   - `acquire_session()` handles the "reuse cached session, refresh access token, or full login" logic
   - Uses `anyhow::Result` at the top level; adds `.context()` at each fallible boundary
 
@@ -66,7 +67,8 @@ cargo fmt -- --check # Check formatting without modifying
 
 - **args.rs**: CLI argument parsing using `clap`.
   - `Args` struct with `email`, `two_factor` (defaults to `authenticator`), `api_url`, `identity_url`, `session_timeout`
-  - `Command` subcommand enum: `Login`, `List`, `Search`, `Get`, `Sync`, `Logout`
+  - `Command` subcommand enum: `Login`, `List`, `Search`, `Get`, `Sync`, `Logout`, `Device { action: DeviceAction }`
+  - `DeviceAction` subcommand enum: `Rotate`
   - Supports environment variable `BW_USERNAME` for email
   - Default URLs point to production Bitwarden servers
 
@@ -77,6 +79,7 @@ cargo fmt -- --check # Check formatting without modifying
   - `prelogin()`: fetches KDF parameters from `/accounts/prelogin/password`
   - `authenticate_password()`: password + 2FA auth against `/connect/token`
   - `refresh_access_token()`: uses the stored refresh token to renew an expired access token
+  - `revoke_refresh_token()`: best-effort `POST /connect/revocation`, invoked from `logout`
   - `AuthError` variants: `Http`, `Api { context, status, body }`, `Parse { context, source, body }`, `AuthFailed`, `MissingKey`
 
 - **crypto.rs**: Cryptographic operations using `bitwarden-crypto`. Returns `Result<_, CryptoError>`.
@@ -85,16 +88,18 @@ cargo fmt -- --check # Check formatting without modifying
   - `decrypt_string()`, `decrypt_optional_string()`
 
 - **vault.rs**: Vault operations via direct API calls. Returns `Result<_, VaultError>`.
-  - `fetch_vault()`: pulls the encrypted vault from `/sync`
+  - `fetch_vault()`: pulls the encrypted vault from `/sync`, rejects response bodies larger than `MAX_SYNC_BYTES` (50 MB) to bound memory on a hostile/misbehaving server
   - `cipher_key()`, `decrypt_cipher()`: honour per-cipher keys when set, fall back to the user key
-  - `VaultError` wraps `reqwest::Error`, an `Api { status, body }` variant, and `CryptoError`
+  - `VaultError` variants: `Http` (`reqwest::Error`), `Api { status, body }`, `BodyTooLarge(u64)`, `Parse(serde_json::Error)`, `Crypto(CryptoError)`, `MissingName`
 
 - **session.rs**: Persistent session + vault caching. Returns `Result<_, SessionError>`.
   - `load_session` / `save_session` / `clear_session`: session tokens + base64-encoded user key stored in the OS keychain via the `keyring` crate
-  - `load_vault_cache` / `save_vault_cache` / `clear_vault_cache`: encrypted vault cached at `~/.config/bw-rs/vault_cache.json` (mode 0600)
-  - `load_or_create_device_id`: persistent per-install device UUID at `~/.config/bw-rs/device_id`
-  - `SessionData::is_valid` (idle timeout) and `access_token_expired` (30s safety margin) drive the refresh logic in `acquire_session`
-  - `SessionError` variants: `HomeNotSet`, `InvalidKey`, plus `#[from]` wrappers for `io::Error`, `keyring::Error`, `serde_json::Error`, `base64::DecodeError`
+  - `load_vault_cache` / `save_vault_cache` / `clear_vault_cache`: encrypted vault cached at `~/.config/bw-rs/vault_cache_<sha256[..4]>.json` (mode 0600, one file per account, keyed on a sha256 prefix of the email)
+  - The config directory `~/.config/bw-rs` itself is chmod'd to 0700
+  - `load_or_create_device_id`: persistent per-install device UUID at `~/.config/bw-rs/device_id` (mode 0600)
+  - `rotate_device_id`: overwrite the device id with a fresh UUID (backing `bw device rotate`)
+  - `SessionData::is_valid` (idle timeout) and `access_token_expired` (30s safety margin) drive the refresh logic in `acquire_session`; both return `Result<bool, SessionError>` because they read the system clock. `SessionData::from_parts` and `SessionData::touch` and `VaultCache::is_fresh` are also `Result`-returning for the same reason
+  - `SessionError` variants: `HomeNotSet`, `InvalidKey`, `Clock`, plus `#[from]` wrappers for `io::Error`, `keyring::Error`, `serde_json::Error`, `base64::DecodeError`
 
 ### Error Handling
 
@@ -118,6 +123,8 @@ cargo fmt -- --check # Check formatting without modifying
 - **uuid** (v1.23.1): UUIDs for the persistent device identifier
 - **rpassword** (v7.5): Hidden master-password input
 - **serde/serde_json** (v1.0): JSON serialization
+- **zeroize** (v1): Zeroizes the master password and derived hash in memory once dropped
+- **sha2** (v0.10): Sha256 for deriving the per-account vault cache filename suffix
 
 ### Command Dispatch
 
@@ -125,11 +132,12 @@ cargo fmt -- --check # Check formatting without modifying
 
 1. Parse CLI arguments.
 2. If no subcommand → print help and exit. No session, no vault fetch.
-3. If `logout` → clear the keychain entry and the on-disk vault cache. Exit.
-4. Otherwise call `acquire_session()` (details below).
-5. If `login` → session is cached; print confirmation and exit.
-6. If `sync` → force a fresh vault fetch, save to cache, print item count.
-7. Otherwise (`list`, `search`, `get`) → use the cached vault if fresh, else fetch and cache. Then run the command.
+3. If `device rotate` → overwrite the stored device UUID and exit. No session, no vault fetch.
+4. If `logout` → best-effort `auth::revoke_refresh_token()` (a failure here is warned, not fatal), then clear the keychain entry and the on-disk vault cache. Exit.
+5. Otherwise call `acquire_session()` (details below).
+6. If `login` → session is cached; print confirmation and exit.
+7. If `sync` → force a fresh vault fetch, save to cache, print item count.
+8. Otherwise (`list`, `search`, `get`) → use the cached vault if fresh, else fetch and cache. Then run the command.
 
 ### Session Lifecycle (`acquire_session`)
 
@@ -142,7 +150,7 @@ cargo fmt -- --check # Check formatting without modifying
 
 ### `full_auth` (fresh login)
 
-1. Prompt for master password (`rpassword`, hidden) and OTP token if 2FA is set.
+1. Prompt for master password (`rpassword`, hidden) and OTP token if 2FA is set. The password and the derived server-authorization hash are wrapped in `Zeroizing<String>` so they are zeroized when dropped.
 2. `auth::prelogin()` → KDF parameters.
 3. `crypto::derive_master_key()` + `crypto::hash_password()`.
 4. `auth::authenticate_password()` → `POST /identity/connect/token`. Returns access token, refresh token, encrypted user key.

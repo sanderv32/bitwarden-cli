@@ -41,7 +41,8 @@ one of:
 | `search <query>` | Case-insensitive substring match on decrypted item names. |
 | `get <uuid>/<field>` | Prints a single field. Fields: `username`, `password`, `totp`, `notes`, `name`. |
 | `sync`   | Force-refresh the on-disk vault cache. |
-| `logout` | Clears the cached session and vault cache. |
+| `logout` | Best-effort revokes the refresh token server-side, then clears the cached session and vault cache. |
+| `device rotate` | Regenerate the persisted device UUID (see below). |
 
 Any subcommand that needs the vault will fall back to a full login prompt if
 no valid session is cached — `bw login` just makes that step explicit.
@@ -55,10 +56,11 @@ no valid session is cached — `bw login` just makes that step explicit.
 ### Where state lives
 
 - **Session** (access token, refresh token, encrypted user key): OS keychain via the `keyring` crate, service `bw-rs`.
-- **Encrypted vault cache**: `~/.config/bw-rs/vault_cache.json` (mode 0600).
-- **Device UUID**: `~/.config/bw-rs/device_id`.
+- **Encrypted vault cache**: `~/.config/bw-rs/vault_cache_<sha256[..4]>.json` (mode 0600, one file per account).
+- **Device UUID**: `~/.config/bw-rs/device_id` (mode 0600).
+- The config directory itself is locked to mode 0700.
 
-`bw logout` clears the first two.
+`bw logout` clears the first two (and attempts a server-side refresh-token revocation). `bw device rotate` regenerates the device UUID — Bitwarden uses this value as an anti-fuzzing signal for 2FA-bypass detection, so treat it as sensitive.
 
 ## Development
 
