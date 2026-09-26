@@ -40,4 +40,16 @@ pub enum Command {
     Logout,
     /// Force-refresh the local vault cache from the server.
     Sync,
+    /// Manage this install's persistent device identifier.
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DeviceAction {
+    /// Rotate the persistent device identifier. Existing sessions remain valid
+    /// but future auth requests will present a new device UUID to the server.
+    Rotate,
 }

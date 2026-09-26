@@ -6,9 +6,10 @@ use std::io::{self, Write, stdin, stdout};
 use std::num::NonZero;
 use thiserror::Error;
 use tracing::info;
+use zeroize::Zeroizing;
 
 use lib::{
-    args::{Args, Command},
+    args::{Args, Command, DeviceAction},
     auth, crypto,
     session::{self, SessionData},
     two_factor_mapping::TwoFactor,
@@ -29,7 +30,7 @@ fn input(label: &str) -> Result<String, InputError> {
     Ok(s.trim().to_string())
 }
 
-fn password(label: &str) -> Result<String, InputError> {
+fn password(label: &str) -> Result<Zeroizing<String>, InputError> {
     print!("{label}: ");
     let _ = stdout().flush();
     let config = rpassword::ConfigBuilder::new()
@@ -37,7 +38,7 @@ fn password(label: &str) -> Result<String, InputError> {
         .build();
 
     let password = rpassword::read_password_with_config(config)?;
-    Ok(password)
+    Ok(Zeroizing::new(password))
 }
 
 /// Full password + 2FA auth flow. Returns a fresh `SessionData` ready to save.
@@ -59,8 +60,8 @@ async fn full_auth(
         .await
         .context("prelogin")?;
 
-    let iterations = u32::try_from(prelogin_response.kdf_iterations)
-        .context("KDF iterations out of range")?;
+    let iterations =
+        u32::try_from(prelogin_response.kdf_iterations).context("KDF iterations out of range")?;
     let kdf = match prelogin_response.kdf {
         0 => Kdf::PBKDF2 {
             iterations: NonZero::new(iterations).context("KDF iterations must be non-zero")?,
@@ -81,15 +82,15 @@ async fn full_auth(
         other => bail!("Unsupported KDF type: {other}"),
     };
 
-    let master_key = crypto::derive_master_key(&master_password, email, &kdf)
-        .context("deriving master key")?;
-    let password_hash = crypto::hash_password(&master_password, email, &kdf)
-        .context("hashing master password")?;
+    let master_key =
+        crypto::derive_master_key(&master_password, email, &kdf).context("deriving master key")?;
+    let password_hash = Zeroizing::new(
+        crypto::hash_password(&master_password, email, &kdf).context("hashing master password")?,
+    );
 
     let two_factor_provider = Some(args.two_factor.to_provider_id());
     let auth_result = auth::authenticate_password(
         email,
-        &master_password,
         &password_hash,
         otp_token.as_deref(),
         two_factor_provider,
@@ -102,13 +103,14 @@ async fn full_auth(
     let user_key = crypto::decrypt_user_key(&auth_result.encrypted_user_key, &master_key)
         .context("decrypting user key")?;
 
-    Ok(SessionData::from_parts(
+    SessionData::from_parts(
         email,
         auth_result.access_token,
         auth_result.refresh_token,
         u64::from(auth_result.expires_in),
         &user_key,
-    ))
+    )
+    .context("building session data")
 }
 
 /// Resolve to a live (`access_token`, `user_key`) pair, either from a stored session
@@ -120,8 +122,14 @@ async fn acquire_session(
     device_id: &str,
 ) -> Result<(String, SymmetricCryptoKey)> {
     if let Some(mut stored) = session::load_session(email).context("loading stored session")? {
-        if stored.is_valid(args.session_timeout) {
-            if stored.access_token_expired() {
+        if stored
+            .is_valid(args.session_timeout)
+            .context("checking session validity")?
+        {
+            if stored
+                .access_token_expired()
+                .context("checking access token expiry")?
+            {
                 if let Some(rt) = stored.refresh_token.clone() {
                     match auth::refresh_access_token(&rt, identity_url, device_id).await {
                         Ok(refreshed) => {
@@ -130,10 +138,11 @@ async fn acquire_session(
                             if refreshed.refresh_token.is_some() {
                                 stored.refresh_token = refreshed.refresh_token;
                             }
-                            stored.access_token_expires_at = std::time::SystemTime::now()
+                            let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .map_or(0, |d| d.as_secs())
-                                + u64::from(refreshed.expires_in);
+                                .context("reading system clock")?
+                                .as_secs();
+                            stored.access_token_expires_at = now + u64::from(refreshed.expires_in);
                         }
                         Err(e) => {
                             eprintln!("Session refresh failed ({e}), falling back to full login");
@@ -151,7 +160,7 @@ async fn acquire_session(
                 }
             }
             let key = stored.user_key().context("decoding stored user key")?;
-            stored.touch();
+            stored.touch().context("touching session timestamp")?;
             session::save_session(&stored).context("saving session")?;
             return Ok((stored.access_token, key));
         }
@@ -177,8 +186,10 @@ async fn resolve_ciphers(
     force_sync: bool,
 ) -> Result<Vec<CipherDetailsResponseModel>> {
     if !force_sync
-        && let Some(cache) = session::load_vault_cache().context("loading vault cache")?
-        && cache.is_fresh(email, args.session_timeout)
+        && let Some(cache) = session::load_vault_cache(email).context("loading vault cache")?
+        && cache
+            .is_fresh(email, args.session_timeout)
+            .context("checking vault cache freshness")?
     {
         info!("Using cached vault ({} items)", cache.ciphers.len());
         return Ok(cache.ciphers);
@@ -296,9 +307,25 @@ async fn main() -> Result<()> {
 
     let email = args.email.trim().to_lowercase();
 
+    if let Command::Device { action } = command {
+        match action {
+            DeviceAction::Rotate => {
+                let new_id = session::rotate_device_id().context("rotating device id")?;
+                println!("Device id rotated: {new_id}");
+            }
+        }
+        return Ok(());
+    }
+
     if matches!(command, Command::Logout) {
+        if let Some(stored) = session::load_session(&email).context("loading stored session")?
+            && let Some(rt) = stored.refresh_token.as_deref()
+            && let Err(e) = auth::revoke_refresh_token(rt, &args.identity_url).await
+        {
+            eprintln!("Warning: server-side revocation failed: {e}");
+        }
         session::clear_session(&email).context("clearing session")?;
-        session::clear_vault_cache().context("clearing vault cache")?;
+        session::clear_vault_cache(&email).context("clearing vault cache")?;
         println!("Session cleared for {email}");
         return Ok(());
     }
@@ -313,8 +340,7 @@ async fn main() -> Result<()> {
     }
 
     let force_sync = matches!(command, Command::Sync);
-    let ciphers =
-        resolve_ciphers(&args, &email, &args.api_url, &access_token, force_sync).await?;
+    let ciphers = resolve_ciphers(&args, &email, &args.api_url, &access_token, force_sync).await?;
     let personal: Vec<_> = ciphers
         .iter()
         .filter(|c| c.organization_id.is_none())
@@ -325,7 +351,7 @@ async fn main() -> Result<()> {
         Command::List => run_list(&personal, &user_key),
         Command::Search { query } => run_search(&personal, &user_key, query),
         Command::Sync => println!("Vault cache refreshed ({} items)", ciphers.len()),
-        Command::Login | Command::Logout => bail!("handled earlier"),
+        Command::Login | Command::Logout | Command::Device { .. } => bail!("handled earlier"),
     }
 
     Ok(())

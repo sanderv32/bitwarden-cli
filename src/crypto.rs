@@ -8,11 +8,7 @@ use std::str::FromStr;
 ///
 /// # Errors
 /// Returns an error if key derivation fails.
-pub fn derive_master_key(
-    password: &str,
-    email: &str,
-    kdf: &Kdf,
-) -> Result<MasterKey, CryptoError> {
+pub fn derive_master_key(password: &str, email: &str, kdf: &Kdf) -> Result<MasterKey, CryptoError> {
     MasterKey::derive(password, email, kdf)
 }
 
@@ -20,16 +16,10 @@ pub fn derive_master_key(
 ///
 /// # Errors
 /// Returns an error if master key derivation fails.
-pub fn hash_password(
-    password: &str,
-    email: &str,
-    kdf: &Kdf,
-) -> Result<String, CryptoError> {
+pub fn hash_password(password: &str, email: &str, kdf: &Kdf) -> Result<String, CryptoError> {
     let master_key = derive_master_key(password, email, kdf)?;
-    let hash = master_key.derive_master_key_hash(
-        password.as_bytes(),
-        HashPurpose::ServerAuthorization,
-    );
+    let hash =
+        master_key.derive_master_key_hash(password.as_bytes(), HashPurpose::ServerAuthorization);
     Ok(hash.to_string())
 }
 
@@ -49,10 +39,7 @@ pub fn decrypt_user_key(
 ///
 /// # Errors
 /// Returns an error if the encrypted value cannot be parsed or decrypted.
-pub fn decrypt_string(
-    encrypted: &str,
-    key: &SymmetricCryptoKey,
-) -> Result<String, CryptoError> {
+pub fn decrypt_string(encrypted: &str, key: &SymmetricCryptoKey) -> Result<String, CryptoError> {
     let enc_string = EncString::from_str(encrypted)?;
     enc_string.decrypt_with_key(key)
 }
@@ -80,7 +67,8 @@ pub fn decrypt_optional_string(
     encrypted: &Option<String>,
     key: &SymmetricCryptoKey,
 ) -> Result<Option<String>, CryptoError> {
-    encrypted.as_ref()
+    encrypted
+        .as_ref()
         .map(|s| decrypt_string(s, key))
         .transpose()
 }

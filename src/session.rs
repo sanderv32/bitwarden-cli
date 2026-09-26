@@ -10,7 +10,6 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const KEYRING_SERVICE: &str = "bw-rs";
-const VAULT_CACHE_FILE: &str = "vault_cache.json";
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -18,6 +17,8 @@ pub enum SessionError {
     HomeNotSet,
     #[error("stored user key is invalid: {0}")]
     InvalidKey(String),
+    #[error("system clock error: {0}")]
+    Clock(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -32,6 +33,11 @@ fn config_dir() -> Result<PathBuf, SessionError> {
     let home = std::env::var("HOME").map_err(|_| SessionError::HomeNotSet)?;
     let dir = PathBuf::from(home).join(".config").join("bw-rs");
     fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(dir)
 }
 
@@ -55,13 +61,20 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn now_unix() -> u64 {
+fn now_unix() -> Result<u64, SessionError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .map(|d| d.as_secs())
+        .map_err(|e| SessionError::Clock(e.to_string()))
 }
 
 /// Returns a stable device UUID, creating and persisting one on first use.
+///
+/// The device id is written to `~/.config/bw-rs/device_id` (mode 0600) and
+/// reused across runs. Bitwarden treats this value as an anti-fuzzing signal
+/// for 2FA-bypass detection, so it is sensitive: if the file leaks, an
+/// attacker can impersonate the same "device." Use [`rotate_device_id`] to
+/// generate a fresh one.
 ///
 /// # Errors
 /// Returns an error if the config directory cannot be created or the device id
@@ -74,6 +87,19 @@ pub fn load_or_create_device_id() -> Result<String, SessionError> {
             return Ok(trimmed.to_string());
         }
     }
+    let new_id = Uuid::new_v4().to_string();
+    write_private(&path, new_id.as_bytes())?;
+    Ok(new_id)
+}
+
+/// Generates a fresh device UUID, overwriting the persisted one. Returns the
+/// new id.
+///
+/// # Errors
+/// Returns an error if the config directory cannot be created or the device id
+/// file cannot be written.
+pub fn rotate_device_id() -> Result<String, SessionError> {
+    let path = config_dir()?.join("device_id");
     let new_id = Uuid::new_v4().to_string();
     write_private(&path, new_id.as_bytes())?;
     Ok(new_id)
@@ -103,42 +129,50 @@ impl SessionData {
             .map_err(|e| SessionError::InvalidKey(e.to_string()))
     }
 
-    #[must_use]
+    /// # Errors
+    /// Returns an error if the system clock cannot be read.
     pub fn from_parts(
         email: &str,
         access_token: String,
         refresh_token: Option<String>,
         expires_in_seconds: u64,
         user_key: &SymmetricCryptoKey,
-    ) -> Self {
+    ) -> Result<Self, SessionError> {
         let bytes = user_key.to_encoded();
         let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
-        let now = now_unix();
-        Self {
+        let now = now_unix()?;
+        Ok(Self {
             email: email.to_string(),
             access_token,
             refresh_token,
             access_token_expires_at: now + expires_in_seconds,
             last_used_at: now,
             user_key_b64: b64,
-        }
+        })
     }
 
     /// Idle-timeout check: session is valid if last use was within `timeout_minutes`.
-    #[must_use]
-    pub fn is_valid(&self, timeout_minutes: u64) -> bool {
-        let elapsed = now_unix().saturating_sub(self.last_used_at);
-        elapsed < timeout_minutes.saturating_mul(60)
+    ///
+    /// # Errors
+    /// Returns an error if the system clock cannot be read.
+    pub fn is_valid(&self, timeout_minutes: u64) -> Result<bool, SessionError> {
+        let elapsed = now_unix()?.saturating_sub(self.last_used_at);
+        Ok(elapsed < timeout_minutes.saturating_mul(60))
     }
 
     /// True if the Bitwarden `access_token` has expired (30s safety margin).
-    #[must_use]
-    pub fn access_token_expired(&self) -> bool {
-        now_unix() + 30 >= self.access_token_expires_at
+    ///
+    /// # Errors
+    /// Returns an error if the system clock cannot be read.
+    pub fn access_token_expired(&self) -> Result<bool, SessionError> {
+        Ok(now_unix()? + 30 >= self.access_token_expires_at)
     }
 
-    pub fn touch(&mut self) {
-        self.last_used_at = now_unix();
+    /// # Errors
+    /// Returns an error if the system clock cannot be read.
+    pub fn touch(&mut self) -> Result<(), SessionError> {
+        self.last_used_at = now_unix()?;
+        Ok(())
     }
 }
 
@@ -186,25 +220,33 @@ pub struct VaultCache {
 }
 
 impl VaultCache {
-    #[must_use]
-    pub fn is_fresh(&self, email: &str, ttl_minutes: u64) -> bool {
+    /// # Errors
+    /// Returns an error if the system clock cannot be read.
+    pub fn is_fresh(&self, email: &str, ttl_minutes: u64) -> Result<bool, SessionError> {
         if self.email != email {
-            return false;
+            return Ok(false);
         }
-        let elapsed = now_unix().saturating_sub(self.cached_at);
-        elapsed < ttl_minutes.saturating_mul(60)
+        let elapsed = now_unix()?.saturating_sub(self.cached_at);
+        Ok(elapsed < ttl_minutes.saturating_mul(60))
     }
 }
 
-fn vault_cache_path() -> Result<PathBuf, SessionError> {
-    Ok(config_dir()?.join(VAULT_CACHE_FILE))
+fn vault_cache_path(email: &str) -> Result<PathBuf, SessionError> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(email.as_bytes());
+    let mut suffix = String::with_capacity(8);
+    for byte in &digest[..4] {
+        use std::fmt::Write;
+        let _ = write!(&mut suffix, "{byte:02x}");
+    }
+    Ok(config_dir()?.join(format!("vault_cache_{suffix}.json")))
 }
 
 /// # Errors
 /// Returns an error if the cache path cannot be resolved, the file cannot be
 /// read for a reason other than "not found", or the contents cannot be parsed.
-pub fn load_vault_cache() -> Result<Option<VaultCache>, SessionError> {
-    let path = vault_cache_path()?;
+pub fn load_vault_cache(email: &str) -> Result<Option<VaultCache>, SessionError> {
+    let path = vault_cache_path(email)?;
     match fs::read_to_string(&path) {
         Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -220,19 +262,19 @@ pub fn save_vault_cache(
 ) -> Result<(), SessionError> {
     let cache = VaultCache {
         email: email.to_string(),
-        cached_at: now_unix(),
+        cached_at: now_unix()?,
         ciphers: ciphers.to_vec(),
     };
     let json = serde_json::to_string(&cache)?;
-    write_private(&vault_cache_path()?, json.as_bytes())?;
+    write_private(&vault_cache_path(email)?, json.as_bytes())?;
     Ok(())
 }
 
 /// # Errors
 /// Returns an error if the cache path cannot be resolved or the file cannot be
 /// removed for a reason other than "not found".
-pub fn clear_vault_cache() -> Result<(), SessionError> {
-    let path = vault_cache_path()?;
+pub fn clear_vault_cache(email: &str) -> Result<(), SessionError> {
+    let path = vault_cache_path(email)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

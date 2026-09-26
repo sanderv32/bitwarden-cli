@@ -34,4 +34,6 @@ keyring = { version = "3", features = ["apple-native", "linux-native", "windows-
 base64 = "0.23"
 thiserror = "2"
 anyhow = "1"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+sha2 = "0.10"
 

@@ -48,10 +48,7 @@ pub struct PreloginResponse {
 /// # Errors
 /// Returns an error if the HTTP request fails, the server returns a non-success
 /// status, or the response body cannot be parsed as a `PreloginResponse`.
-pub async fn prelogin(
-    email: &str,
-    identity_url: &str,
-) -> Result<PreloginResponse, AuthError> {
+pub async fn prelogin(email: &str, identity_url: &str) -> Result<PreloginResponse, AuthError> {
     let client = reqwest::Client::new();
     let url = format!("{identity_url}/accounts/prelogin/password");
 
@@ -59,11 +56,7 @@ pub async fn prelogin(
         email: email.to_string(),
     };
 
-    tracing::info!("=== Prelogin Request ===");
-    tracing::info!("Method: POST");
-    tracing::info!("URL: {}", url);
-    tracing::info!("Body: {{\"email\":\"{}\"}}", email);
-    tracing::info!("========================");
+    tracing::debug!("POST {}", url);
 
     let response = client
         .post(&url)
@@ -75,10 +68,7 @@ pub async fn prelogin(
     let status = response.status();
     let response_text = response.text().await?;
 
-    tracing::info!("=== Prelogin Response ===");
-    tracing::info!("Status: {}", status);
-    tracing::info!("Body: {}", response_text);
-    tracing::info!("=========================");
+    tracing::debug!("prelogin status={}", status);
 
     if !status.is_success() {
         return Err(AuthError::Api {
@@ -94,7 +84,6 @@ pub async fn prelogin(
         body: response_text,
     })
 }
-
 
 /// Public key encryption key pair
 #[derive(Debug, Deserialize)]
@@ -222,7 +211,6 @@ pub struct RefreshResult {
 /// error, or the server response does not include an encryption key.
 pub async fn authenticate_password(
     email: &str,
-    _master_password: &str,
     password_hash: &str,
     two_factor_token: Option<&str>,
     two_factor_provider: Option<i32>,
@@ -258,28 +246,14 @@ pub async fn authenticate_password(
 
     let url = format!("{identity_url}/connect/token");
 
-    tracing::info!("=== Authentication Request ===");
-    tracing::info!("Method: POST");
-    tracing::info!("URL: {}", url);
-    tracing::info!("Request body:");
-    tracing::info!("  grant_type: password");
-    tracing::info!("  username: {}", email);
-    tracing::info!("  password: {} (hash length: {})", &password_hash[..10], password_hash.len());
-    tracing::info!("  scope: api offline_access");
-    tracing::info!("  client_id: web");
-    tracing::info!("  deviceType: 9");
-    tracing::info!("  deviceIdentifier: {}", device_identifier);
-    tracing::info!("  deviceName: Rust Bitwarden CLI");
-    if let Some(token) = two_factor_token {
-        tracing::info!("  twoFactorToken: {}", token);
-        tracing::info!("  twoFactorProvider: {}", two_factor_provider.unwrap_or(0));
-        tracing::info!("  twoFactorRemember: 0");
-    }
-    tracing::info!("==============================");
+    tracing::debug!("POST {} (grant=password)", url);
 
     let response = client
         .post(&url)
-        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0",
+        )
         .header("Accept", "application/json")
         .header("Accept-Language", "en-US,en;q=0.5")
         .header("Origin", "https://vault.bitwarden.com")
@@ -294,10 +268,7 @@ pub async fn authenticate_password(
     let status = response.status();
     let response_text = response.text().await?;
 
-    tracing::info!("=== Authentication Response ===");
-    tracing::info!("Status: {}", status);
-    tracing::info!("Body: {}", response_text);
-    tracing::info!("==============================");
+    tracing::debug!("authentication status={}", status);
 
     if !status.is_success() {
         return Err(AuthError::Api {
@@ -367,11 +338,14 @@ pub async fn refresh_access_token(
         ("deviceIdentifier", device_identifier),
     ];
 
-    tracing::info!("Refreshing access token via refresh_token grant...");
+    tracing::debug!("POST {} (grant=refresh_token)", url);
 
     let response = client
         .post(&url)
-        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0",
+        )
         .header("Accept", "application/json")
         .header("Origin", "https://vault.bitwarden.com")
         .header("Referer", "https://vault.bitwarden.com/")
@@ -403,4 +377,44 @@ pub async fn refresh_access_token(
         refresh_token: parsed.refresh_token,
         expires_in: parsed.expires_in,
     })
+}
+
+/// Revokes a refresh token on the identity server (`/connect/revocation`).
+///
+/// # Errors
+/// Returns an error if the HTTP request fails or the server returns a non-success status.
+pub async fn revoke_refresh_token(
+    refresh_token: &str,
+    identity_url: &str,
+) -> Result<(), AuthError> {
+    let client = reqwest::Client::new();
+    let url = format!("{identity_url}/connect/revocation");
+
+    let form = [
+        ("client_id", "web"),
+        ("token", refresh_token),
+        ("token_type_hint", "refresh_token"),
+    ];
+
+    tracing::debug!("POST {}", url);
+
+    let response = client
+        .post(&url)
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await?;
+        return Err(AuthError::Api {
+            context: "revocation",
+            status,
+            body,
+        });
+    }
+
+    tracing::debug!("revocation status={}", status);
+    Ok(())
 }

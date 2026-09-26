@@ -4,12 +4,18 @@ use bitwarden_crypto::{CryptoError, SymmetricCryptoKey};
 use reqwest::StatusCode;
 use thiserror::Error;
 
+const MAX_SYNC_BYTES: u64 = 50 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum VaultError {
     #[error(transparent)]
     Http(#[from] reqwest::Error),
     #[error("sync API failed ({status}): {body}")]
     Api { status: StatusCode, body: String },
+    #[error("sync response body too large: {0} bytes (max {MAX_SYNC_BYTES})")]
+    BodyTooLarge(u64),
+    #[error("failed to parse sync response: {0}")]
+    Parse(#[from] serde_json::Error),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
     #[error("cipher has no name")]
@@ -28,11 +34,7 @@ pub async fn fetch_vault(
     let client = reqwest::Client::new();
     let url = format!("{api_url}/sync");
 
-    tracing::info!("=== Sync Request ===");
-    tracing::info!("Method: GET");
-    tracing::info!("URL: {}", url);
-    tracing::info!("Authorization: Bearer {}...", &access_token[..20]);
-    tracing::info!("====================");
+    tracing::debug!("GET {}", url);
 
     let response = client
         .get(&url)
@@ -43,16 +45,24 @@ pub async fn fetch_vault(
 
     let status = response.status();
 
-    tracing::info!("=== Sync Response ===");
-    tracing::info!("Status: {}", status);
-    tracing::info!("=====================");
+    tracing::debug!("sync status={}", status);
 
     if !status.is_success() {
         let body = response.text().await?;
         return Err(VaultError::Api { status, body });
     }
 
-    Ok(response.json().await?)
+    if let Some(len) = response.content_length()
+        && len > MAX_SYNC_BYTES
+    {
+        return Err(VaultError::BodyTooLarge(len));
+    }
+
+    let bytes = response.bytes().await?;
+    if bytes.len() as u64 > MAX_SYNC_BYTES {
+        return Err(VaultError::BodyTooLarge(bytes.len() as u64));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// Decrypted cipher data for display
